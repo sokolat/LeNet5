@@ -1,19 +1,24 @@
 import argparse
-import math
 import time
+
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as F
+import wandb
 import yaml
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer, required
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
-import wandb
 
 
 def get_args():
+    """
+    Parses and returns command-line arguments for training the LeNet5 model
+    with the SDLM optimizer and RBF loss.
+    """
+
     parser = argparse.ArgumentParser(description="Train LeNet5 with SDLM optimizer")
     parser.add_argument(
         "--lr", type=float, default=5e-4, help="Learning rate for SDLM optimizer"
@@ -21,14 +26,30 @@ def get_args():
     parser.add_argument(
         "--damping", type=float, default=0.02, help="Damping term for SDLM optimizer"
     )
-    parser.add_argument("--hessian_batch_size", type=int, default=500,
-                        help="batch size for hessian approximation")
-    parser.add_argument("--mu", type=float, default=0.99,
-                        help="hyper param to prevent step size from being too large")
-    parser.add_argument("--rub_penalty", type=float, default=1.0,
-                        help="penalty for non digit characters")
-    parser.add_argument("--verbose", type=bool, default=False,
-                        help="flag for logging info during training")
+    parser.add_argument(
+        "--hessian_batch_size",
+        type=int,
+        default=500,
+        help="batch size for hessian approximation",
+    )
+    parser.add_argument(
+        "--mu",
+        type=float,
+        default=0.99,
+        help="hyper param to prevent step size from being too large",
+    )
+    parser.add_argument(
+        "--rub_penalty",
+        type=float,
+        default=1.0,
+        help="penalty for non digit characters",
+    )
+    parser.add_argument(
+        "--verbose",
+        type=bool,
+        default=False,
+        help="flag for logging info during training",
+    )
     parser.add_argument(
         "--train_batch_size", type=int, default=1, help="Batch size for training"
     )
@@ -44,20 +65,36 @@ def get_args():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to train on",
     )
-    parser.add_argument("--train_path", type=str, default="./data/train", help="path to train data")
-    parser.add_argument("--test_path", type=str, default="./data/test", help="path to test data")
     parser.add_argument(
-        "--ascii_digits_path", type=str, default="./data/ascii_digits.yaml",
-        help="path to ascii digits characters"
+        "--train_path", type=str, default="./data/train", help="path to train data"
     )
-    parser.add_argument("--wandb_project_name", type=str, default="lenet5", help="name of wandb project")
+    parser.add_argument(
+        "--test_path", type=str, default="./data/test", help="path to test data"
+    )
+    parser.add_argument(
+        "--ascii_digits_path",
+        type=str,
+        default="./data/ascii_digits.yaml",
+        help="path to ascii digits characters",
+    )
+    parser.add_argument(
+        "--wandb_project_name", type=str, default="lenet5", help="name of wandb project"
+    )
     parser.add_argument("--wandb_entity", type=str, help="name of wandb entity")
-    parser.add_argument("--output_dir", type=str, default="./runs", help="path to output directory")
+    parser.add_argument(
+        "--output_dir", type=str, default="./runs", help="path to output directory"
+    )
     parser.add_argument("--track", type=bool, default=False, help="flag for tracking")
     return parser.parse_args()
 
 
 class SubSampler(nn.Module):
+
+    """
+    A custom subsampling (pooling) layer that applies average pooling
+    followed by a learnable affine transformation per channel.
+    """
+
     def __init__(self, in_channels, kernel_size):
         super().__init__()
         self.in_channels = in_channels
@@ -82,6 +119,12 @@ class SubSampler(nn.Module):
 
 
 class C3Layer(nn.Module):
+
+    """
+    Implements the C3 layer of LeNet-5 with custom connection patterns between
+    input and output feature maps using grouped convolutions.
+    """
+
     def __init__(self, in_channels, out_channels, kernel_size):
         super().__init__()
         self.in_channels = in_channels
@@ -134,6 +177,12 @@ class C3Layer(nn.Module):
 
 
 class RBFLayer(nn.Module):
+
+    """
+    A radial basis function (RBF) layer that computes the squared Euclidean distance
+    between the input and class centers.
+    """
+
     def __init__(self, in_features, out_features):
         super().__init__()
         self.out_features = out_features
@@ -147,6 +196,12 @@ class RBFLayer(nn.Module):
 
 
 class RBFLoss(nn.Module):
+
+    """
+    RBF loss function that penalizes incorrect classifications and includes
+    a rubbish class penalty for non-digit inputs.
+    """
+
     def __init__(self, rubbish_penalty=required):
         super().__init__()
         self.j = rubbish_penalty
@@ -162,13 +217,18 @@ class RBFLoss(nn.Module):
 
 
 class SDLMOptimizer(Optimizer):
+    """
+    Implements the SDLM optimizer, which maintains a moving average of squared
+    gradients to estimate a per-parameter second-order curvature.
+    """
+
     def __init__(self, params=required, lr=required, damping=required, mu=required):
         defaults = dict(lr=lr, damping=damping, steps=0, mu=mu)
         super().__init__(params, defaults)
 
         for group in self.param_groups:
-            for param in group['params']:
-                self.state[param]['hessian'] = torch.zeros_like(param)
+            for param in group["params"]:
+                self.state[param]["hessian"] = torch.zeros_like(param)
 
     def step(self, closure=None):
         loss = None
@@ -190,7 +250,7 @@ class SDLMOptimizer(Optimizer):
 
                 old_h = state["hessian"]
 
-                new_h = mu * old_h + (1 - mu) * grads ** 2
+                new_h = mu * old_h + (1 - mu) * grads**2
 
                 self.state[p]["hessian"] = new_h
 
@@ -204,6 +264,12 @@ class SDLMOptimizer(Optimizer):
 
 
 class ScheduledOptimizer(LRScheduler):
+
+    """
+    Implements a manually scheduled learning rate scheduler that adjusts the learning rate
+    based on the epoch number according to predefined intervals.
+    """
+
     def __init__(self, optimizer):
         super().__init__(optimizer)
         self.optimizer = optimizer
@@ -225,6 +291,17 @@ class ScheduledOptimizer(LRScheduler):
 
 
 def load_bitmaps(path):
+    """
+    Loads ASCII digit character representations from a YAML file and
+    converts them into binary bitmap tensors for initializing RBF centers.
+
+    Args:
+        path (str): Path to the YAML file.
+
+    Returns:
+        torch.Tensor: Tensor of shape (10, 84) representing the bitmaps.
+    """
+
     with open(path) as stream:
         try:
             data = yaml.safe_load(stream)
@@ -245,20 +322,20 @@ def load_bitmaps(path):
 
 
 def get_transform():
+    """
+    Returns the composed torchvision transform for preprocessing MNIST data.
+    """
+
     return transforms.Compose([transforms.ToTensor(), transforms.Resize(32)])
 
 
-def get_total_grad_norm(model):
-    total_norm = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    total_norm = total_norm ** 0.5
-    return total_norm
-
-
 class LeNet5(nn.Module):
+
+    """
+    Custom implementation of the LeNet-5 architecture using custom components
+    such as SubSampler, C3Layer, and RBFLayer.
+    """
+
     def __init__(self):
         super().__init__()
         self.origin = 1.7159
@@ -291,7 +368,7 @@ class LeNet5(nn.Module):
             x = feature(x)
             x = self._custom_activation(x)
 
-        for i, layer in enumerate(self.classifier):
+        for layer in self.classifier:
             x = layer(x)
 
             if isinstance(layer, nn.Linear):
@@ -323,8 +400,32 @@ class LeNet5(nn.Module):
                 layer.centers.data = load_bitmaps(path)
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, train_loss, train_accuracy, val_loss, val_accuracy,
-                    checkpoint_path):
+def save_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    epoch,
+    train_loss,
+    train_accuracy,
+    val_loss,
+    val_accuracy,
+    checkpoint_path,
+):
+    """
+    Saves model, optimizer, and scheduler state dictionaries and metrics to disk.
+
+    Args:
+        model (nn.Module): Trained model to save.
+        optimizer (Optimizer): Optimizer used during training.
+        scheduler (LRScheduler): Learning rate scheduler.
+        epoch (int): Current epoch number.
+        train_loss (float): Training loss at checkpoint.
+        train_accuracy (float): Training accuracy at checkpoint.
+        val_loss (float): Validation loss at checkpoint.
+        val_accuracy (float): Validation accuracy at checkpoint.
+        checkpoint_path (str): File path to save the checkpoint.
+    """
+
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
@@ -340,8 +441,24 @@ def save_checkpoint(model, optimizer, scheduler, epoch, train_loss, train_accura
 
 
 def train_model(
-        hess_model, model, criterion, scheduler, device, args, logger=None, checkpoint=None
+    hess_model, model, criterion, scheduler, device, args, logger=None, checkpoint=None
 ):
+    """
+    Trains the LeNet5 model using SDLM optimizer and RBF loss,
+    optionally resuming from a checkpoint.
+    Also computes Hessian approximations periodically for curvature-aware optimization.
+
+    Args:
+        hess_model (nn.Module): A separate model used for Hessian estimation.
+        model (nn.Module): The main model to train.
+        criterion (nn.Module): Loss function (RBFLoss).
+        scheduler (LRScheduler): Custom learning rate scheduler with optimizer.
+        device (torch.device): Device to train on (CPU or CUDA).
+        args (Namespace): Parsed command-line arguments.
+        logger (SummaryWriter, optional): TensorBoard logger.
+        checkpoint (dict, optional): Previous training state to resume from.
+    """
+
     last_epoch = 0
 
     model.to(device)
@@ -351,11 +468,19 @@ def train_model(
     train_dataset = datasets.MNIST(
         root=args.train_path, download=True, transform=transform
     )
-    test_dataset = datasets.MNIST(root=args.test_path, download=True, transform=transform)
+    test_dataset = datasets.MNIST(
+        root=args.test_path, download=True, transform=transform
+    )
 
-    train_loader = DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.test_batch_size, shuffle=True)
-    hessian_dataloader = DataLoader(train_dataset, batch_size=args.hessian_batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.train_batch_size, shuffle=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=args.test_batch_size, shuffle=True
+    )
+    hessian_dataloader = DataLoader(
+        train_dataset, batch_size=args.hessian_batch_size, shuffle=True
+    )
 
     hessian_dataloader_iterator = iter(hessian_dataloader)
 
@@ -401,7 +526,9 @@ def train_model(
         for params in hess_model.parameters():
             if params.requires_grad:
                 p_grad = torch.autograd.grad(loss, params, create_graph=True)[0]
-                second_order_der = torch.autograd.grad(p_grad.sum(), params, retain_graph=True)[0]
+                second_order_der = torch.autograd.grad(
+                    p_grad.sum(), params, retain_graph=True
+                )[0]
 
                 scheduler.optimizer.state[params]["hessian"] = second_order_der
 
@@ -437,7 +564,9 @@ def train_model(
         epoch_error_rate = 1 - running_correct / len(train_dataset)
 
         val_loss, val_error_rate = evaluate(model, test_loader, criterion, device)
-        print(f"Epoch {epoch} loss: {epoch_loss:.4f} error rate: {epoch_error_rate:.4f}")
+        print(
+            f"Epoch {epoch} loss: {epoch_loss:.4f} error rate: {epoch_error_rate:.4f}"
+        )
         print(f"Validation Loss: {val_loss:.4f} error rate: {val_error_rate:.4f}")
 
         logger.add_scalar("Error Rate/Train", epoch_error_rate, epoch)
@@ -449,11 +578,24 @@ def train_model(
 
 @torch.no_grad()
 def evaluate(model, val_loader, criterion, device):
+    """
+    Evaluates the trained model on a validation set.
+
+    Args:
+        model (nn.Module): Trained model to evaluate.
+        val_loader (DataLoader): DataLoader for validation set.
+        criterion (nn.Module): Loss function (RBFLoss).
+        device (torch.device): Device to run evaluation on.
+
+    Returns:
+        tuple: Average validation loss and error rate.
+    """
+
     val_loss = 0.0
     correct = 0
     total = 0
     model.eval()
-    for (data, target) in val_loader:
+    for data, target in val_loader:
         data, target = data.to(device), target.to(device)
 
         pred = model(data)
@@ -469,6 +611,11 @@ def evaluate(model, val_loader, criterion, device):
 
 
 def main():
+    """
+    Main function to parse arguments, initialize training components,
+    and start the training loop.
+    """
+
     args = get_args()
 
     run_name = f"run-{int(time.time())}_lenet5_mnist"
