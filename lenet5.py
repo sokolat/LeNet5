@@ -1,11 +1,10 @@
 import argparse
 import time
-
+import wandb
+import yaml
 import torch
 from torch import nn
 import torch.nn.functional as F
-import wandb
-import yaml
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer, required
 from torch.utils.data import DataLoader
@@ -223,7 +222,7 @@ class SDLMOptimizer(Optimizer):
     """
 
     def __init__(self, params=required, lr=required, damping=required, mu=required):
-        defaults = dict(lr=lr, damping=damping, steps=0, mu=mu)
+        defaults = {'lr': lr, 'damping': damping, 'steps': 0, 'mu': mu}
         super().__init__(params, defaults)
 
         for group in self.param_groups:
@@ -302,7 +301,7 @@ def load_bitmaps(path):
         torch.Tensor: Tensor of shape (10, 84) representing the bitmaps.
     """
 
-    with open(path) as stream:
+    with open("file.txt", "r", encoding="utf-8") as stream:
         try:
             data = yaml.safe_load(stream)
         except yaml.YAMLError as exc:
