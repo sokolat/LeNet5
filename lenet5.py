@@ -1,15 +1,20 @@
 import argparse
+import os
+import random
 import time
-import wandb
-import yaml
+
+import numpy as np
 import torch
-from torch import nn
 import torch.nn.functional as F
+import yaml
+from torch import nn
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer, required
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
+
+import wandb
 
 
 def get_args():
@@ -84,6 +89,22 @@ def get_args():
         "--output_dir", type=str, default="./runs", help="path to output directory"
     )
     parser.add_argument("--track", type=bool, default=False, help="flag for tracking")
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="checkpoints",
+        help="Directory to save model checkpoints",
+    )
+
+    parser.add_argument(
+        "--latest_checkpoint_path",
+        type=str,
+        help="Latest checkpoint path",
+    )
+
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Seed for reproducible experiment"
+    )
     return parser.parse_args()
 
 
@@ -222,7 +243,7 @@ class SDLMOptimizer(Optimizer):
     """
 
     def __init__(self, params=required, lr=required, damping=required, mu=required):
-        defaults = {'lr': lr, 'damping': damping, 'steps': 0, 'mu': mu}
+        defaults = {"lr": lr, "damping": damping, "steps": 0, "mu": mu}
         super().__init__(params, defaults)
 
         for group in self.param_groups:
@@ -301,7 +322,7 @@ def load_bitmaps(path):
         torch.Tensor: Tensor of shape (10, 84) representing the bitmaps.
     """
 
-    with open("file.txt", "r", encoding="utf-8") as stream:
+    with open(path, "r", encoding="utf-8") as stream:
         try:
             data = yaml.safe_load(stream)
         except yaml.YAMLError as exc:
@@ -326,6 +347,16 @@ def get_transform():
     """
 
     return transforms.Compose([transforms.ToTensor(), transforms.Resize(32)])
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class LeNet5(nn.Module):
@@ -399,46 +430,6 @@ class LeNet5(nn.Module):
                 layer.centers.data = load_bitmaps(path)
 
 
-def save_checkpoint(
-    model,
-    optimizer,
-    scheduler,
-    epoch,
-    train_loss,
-    train_accuracy,
-    val_loss,
-    val_accuracy,
-    checkpoint_path,
-):
-    """
-    Saves model, optimizer, and scheduler state dictionaries and metrics to disk.
-
-    Args:
-        model (nn.Module): Trained model to save.
-        optimizer (Optimizer): Optimizer used during training.
-        scheduler (LRScheduler): Learning rate scheduler.
-        epoch (int): Current epoch number.
-        train_loss (float): Training loss at checkpoint.
-        train_accuracy (float): Training accuracy at checkpoint.
-        val_loss (float): Validation loss at checkpoint.
-        val_accuracy (float): Validation accuracy at checkpoint.
-        checkpoint_path (str): File path to save the checkpoint.
-    """
-
-    checkpoint = {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "train_loss": train_loss,
-        "train_accuracy": train_accuracy,
-        "val_loss": val_loss,
-        "val_accuracy": val_accuracy,
-    }
-    torch.save(checkpoint, checkpoint_path)
-    print(f"Checkpoint saved at epoch {epoch}!")
-
-
 def train_model(
     hess_model, model, criterion, scheduler, device, args, logger=None, checkpoint=None
 ):
@@ -486,10 +477,10 @@ def train_model(
     if checkpoint is not None:
         if args.verbose:
             print("Resuming training from previous model checkpoint...")
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model = checkpoint["model"]
         if args.verbose:
             print("Reloading previous optimizer state...")
-        scheduler.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.optimizer = checkpoint["optimizer"]
         last_epoch = checkpoint["epoch"]
     else:
         if args.verbose:
@@ -502,6 +493,8 @@ def train_model(
         print(f"Starting training at epoch {last_epoch + 1}")
 
     global_step = 0
+
+    save_dir = f"{args.checkpoint_dir}/{time.time()}_lenet5_mnist"
 
     model.train()
     for epoch in range(last_epoch + 1, args.num_epochs + 1):
@@ -555,24 +548,39 @@ def train_model(
                 if args.verbose:
                     print(
                         f"Step: {step + 1} running average loss: {running_avg_loss:.4f}"
-                        f" running error rate: {1 - running_accuracy:.4f} "
+                        f" running accuracy: {running_accuracy:.4f} "
                     )
                     print("______________________________________")
 
         epoch_loss = running_loss / len(train_dataset)
-        epoch_error_rate = 1 - running_correct / len(train_dataset)
+        epoch_accuracy = running_correct / len(train_dataset)
 
-        val_loss, val_error_rate = evaluate(model, test_loader, criterion, device)
-        print(
-            f"Epoch {epoch} loss: {epoch_loss:.4f} error rate: {epoch_error_rate:.4f}"
+        val_loss, val_accuracy = evaluate(model, test_loader, criterion, device)
+        print(f"Epoch {epoch} loss: {epoch_loss:.4f} accuracy: {epoch_accuracy:.4f}")
+        print(f"Validation Loss: {val_loss:.4f} accuracy: {val_accuracy:.4f}")
+
+        logger.add_scalars(
+            "Accuracy", {"Train": epoch_accuracy, "Validation": val_accuracy}, epoch
         )
-        print(f"Validation Loss: {val_loss:.4f} error rate: {val_error_rate:.4f}")
 
-        logger.add_scalar("Error Rate/Train", epoch_error_rate, epoch)
-        logger.add_scalar("Error Rate/Validation", val_error_rate, epoch)
+        logger.add_scalars("Loss", {"Train": epoch_loss, "Validation": val_loss}, epoch)
 
-        logger.add_scalar("Loss/Train", epoch_loss, epoch)
-        logger.add_scalar("Loss/Validation", val_loss, epoch)
+        os.makedirs(save_dir, exist_ok=True)
+
+        filename = (
+            f"epoch{epoch}_val_loss{val_loss:.4f}_val_accuracy{val_accuracy:.4f}.pt"
+        )
+        checkpoint_path = os.path.join(save_dir, filename)
+
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model,
+                "optimizer": scheduler.optimizer,
+            },
+            checkpoint_path,
+        )
+        print(f"Checkpoint saved at epoch {epoch}!")
 
 
 @torch.no_grad()
@@ -605,8 +613,8 @@ def evaluate(model, val_loader, criterion, device):
         total += data.size(0)
 
     avg_loss = val_loss / total
-    error_rate = 1 - correct / total
-    return avg_loss, error_rate
+    accuracy = correct / total
+    return avg_loss, accuracy
 
 
 def main():
@@ -616,6 +624,8 @@ def main():
     """
 
     args = get_args()
+
+    set_seed(args.seed)
 
     run_name = f"run-{int(time.time())}_lenet5_mnist"
 
@@ -647,7 +657,14 @@ def main():
     )
     scheduler = ScheduledOptimizer(optimizer)
 
-    train_model(hess_model, model, criterion, scheduler, device, args, logger)
+    if args.latest_checkpoint_path is not None:
+        checkpoint = torch.load(args.latest_checkpoint_path, weights_only=False)
+    else:
+        checkpoint = None
+
+    train_model(
+        hess_model, model, criterion, scheduler, device, args, logger, checkpoint
+    )
 
 
 if __name__ == "__main__":

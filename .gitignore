@@ -1,3 +1,6 @@
 data/train/
 data/test/
 .idea/
+checkpoints/
+runs/
+wandb/

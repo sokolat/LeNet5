@@ -1,0 +1,18 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+tensorboard = "*"
+torchvision = "*"
+torch = "*"
+wandb = "*"
+numpy = "*"
+
+[dev-packages]
+pylint = "*"
+black = "*"
+
+[requires]
+python_version = "3.11"
